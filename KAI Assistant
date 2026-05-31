@@ -1,0 +1,135 @@
+import os
+import json
+import logging
+import anthropic
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+
+logging.basicConfig(level=logging.INFO)
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+MEMORY_FILE = "memory.json"
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+SYSTEM_PROMPT = """Ты — JARVIS, персональный ИИ-ассистент. Умный, краткий, слегка саркастичный. Обращаешься к пользователю "сэр".
+
+У тебя есть долгосрочная память о пользователе — она передаётся в начале каждого сообщения в блоке [ПАМЯТЬ].
+Когда узнаёшь что-то важное о пользователе (цели, привычки, предпочтения, проекты) — запоминай это.
+Если нужно обновить память, добавь в конец ответа блок:
+[ЗАПОМНИ: краткий факт о пользователе]
+
+Можешь запоминать несколько фактов за раз:
+[ЗАПОМНИ: факт 1]
+[ЗАПОМНИ: факт 2]
+
+Отвечай на языке пользователя. Будь полезен, конкретен, не растекайся."""
+
+def load_memory(user_id: int) -> list:
+    if not os.path.exists(MEMORY_FILE):
+        return []
+    with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get(str(user_id), [])
+
+def save_memory(user_id: int, memory: list):
+    data = {}
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    data[str(user_id)] = memory[-50:]  # храним последние 50 фактов
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_history(user_id: int) -> list:
+    history_file = f"history_{user_id}.json"
+    if not os.path.exists(history_file):
+        return []
+    with open(history_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_history(user_id: int, history: list):
+    history_file = f"history_{user_id}.json"
+    with open(history_file, "w", encoding="utf-8") as f:
+        json.dump(history[-20:], f, ensure_ascii=False, indent=2)  # последние 20 сообщений
+
+def extract_memories(text: str) -> tuple[str, list]:
+    """Извлекает теги [ЗАПОМНИ: ...] из ответа и возвращает чистый текст + список фактов"""
+    import re
+    facts = re.findall(r'\[ЗАПОМНИ:\s*(.+?)\]', text)
+    clean_text = re.sub(r'\[ЗАПОМНИ:\s*.+?\]\n?', '', text).strip()
+    return clean_text, facts
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Системы инициализированы, сэр. JARVIS готов к работе.\n\n"
+        "Я запоминаю важное о вас между сессиями. Просто говорите со мной."
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_text = update.message.text
+
+    memory = load_memory(user_id)
+    history = load_history(user_id)
+
+    memory_block = ""
+    if memory:
+        memory_block = "[ПАМЯТЬ]\n" + "\n".join(f"- {m}" for m in memory) + "\n\n"
+
+    full_message = memory_block + user_text
+
+    history.append({"role": "user", "content": full_message})
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=history
+        )
+        reply_raw = response.content[0].text
+        reply, new_facts = extract_memories(reply_raw)
+
+        if new_facts:
+            memory.extend(new_facts)
+            save_memory(user_id, memory)
+
+        history[-1] = {"role": "user", "content": user_text}
+        history.append({"role": "assistant", "content": reply})
+        save_history(user_id, history)
+
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        await update.message.reply_text("Помехи в системе, сэр. Попробуйте ещё раз.")
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    memory = load_memory(user_id)
+    if not memory:
+        await update.message.reply_text("Память пуста, сэр. Расскажите мне о себе.")
+    else:
+        text = "📋 Что я знаю о вас:\n\n" + "\n".join(f"• {m}" for m in memory)
+        await update.message.reply_text(text)
+
+async def clear_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    save_memory(user_id, [])
+    await update.message.reply_text("Память очищена, сэр.")
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("memory", memory_command))
+    app.add_handler(CommandHandler("clearmemory", clear_memory))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("JARVIS запущен...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
